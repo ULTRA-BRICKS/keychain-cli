@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hyper-keychain"
+version = "0.1.0"
+description = "keychain — secrets for rig utilities from the OS keychain (macOS Keychain, Linux Secret Service): stdin-only input, exec injection, per-utility policy, value-free audit."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Alex Mextner" }]
+# No runtime dependencies: the Secret Service is spoken over a stdlib D-Bus client and macOS
+# goes through /usr/bin/security. Fewer packages in the path of every secret.
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+keychain = "keychainlib.cli:main"
+
+[project.urls]
+Homepage = "https://git.hyperide.ai/ultrabricks/keychain-cli"
+
+[tool.setuptools.packages.find]
+include = ["keychainlib*"]
+
+[tool.setuptools.package-data]
+keychainlib = ["SKILL.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: talks to the real OS secret store (opt-in: KEYCHAIN_LIVE=1)"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 110

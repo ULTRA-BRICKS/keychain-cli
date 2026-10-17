@@ -1,0 +1,19 @@
+#!/usr/bin/env -S python3 -I
+# Thin shim for the symlink install path (install.sh links ~/.local/bin/keychain here; the
+# symlink must resolve back to the repo to find the keychainlib package). Package installs use
+# [project.scripts] keychain = "keychainlib.cli:main" and never run this file. Keep it MINIMAL:
+# it runs before any check, with the user's rights, and handles secrets. `-I` (isolated mode)
+# ignores PYTHONPATH, PYTHON* variables and user site-packages, so a project's `getpass.py` or
+# `socket.py` cannot load into the process that holds the secrets.
+import os
+import sys
+
+# Add the real repo root to sys.path ONLY when the sibling package is present there. Never the
+# cwd: a stray keychainlib/ in whatever directory an agent runs us from must not shadow ours.
+_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+if os.path.isfile(os.path.join(_root, "keychainlib", "__init__.py")):
+    sys.path.insert(0, _root)
+
+from keychainlib.cli import main  # noqa: E402
+
+raise SystemExit(main())

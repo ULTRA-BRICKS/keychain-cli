@@ -1,0 +1,32 @@
+# rig.yaml — REPO-LEVEL config only.
+# The machine-wide installs (skills, agent-hooks, git-hooks dispatcher, MCP, harness
+# auto-mode) live in the GLOBAL layer ~/.config/rig/config.yaml and are NOT repeated here.
+# This file holds only what is specific to THIS repo (CI gates, repo settings). The cascade
+# is by LOCATION: global is global, this committed file is the repo and overrides it.
+# Apply: rig apply.  Drift: rig status.
+
+version: 1
+
+# Worktree-only guard: primary checkout stays on the default branch for merge/pull/read-only
+# only; all authoring happens in a separate `git worktree add` tree. Adds ONLY worktree_only
+# on top of the global agent_hooks block (~/.config/rig/config.yaml, enabled/all) — does not
+# change what hooks install, just gates worktree-only-writes (pre-write) + pin-primary-worktree
+# (pre-bash). See rig-cli AGENTS.md "Harness workflow guards" and the
+# RIG_HATCH_REQUEST_WORKTREE_ONLY_WRITES / RIG_HATCH_REQUEST_PIN_PRIMARY_WORKTREE hatches for a
+# deliberate one-off bypass. (Alex, 2026-09-07: agents were editing/branching directly in this
+# primary checkout.)
+agent_hooks:
+  worktree_only: true
+
+ci:
+  enabled: false
+
+ecosystem_readme:
+  enabled: true
+
+task:
+  backend: forgejo
+  forgejo:
+    url: https://git.hyperide.ai
+    repo: ultrabricks/keychain-cli
+    attachment_mode: native
