@@ -105,3 +105,28 @@ def test_peer_uid_check_accepts_own_socket():
     finally:
         a.close()
         b.close()
+
+
+def test_unknown_method_is_not_found_only_for_item_calls(monkeypatch):
+    """A vanished item path maps to NotFound; the same D-Bus error elsewhere stays a failure."""
+    from keychainlib.backends.dbus import DBusError
+    from keychainlib.backends.secretservice import SecretServiceBackend
+    from keychainlib.errors import BackendError, NotFound
+
+    class Conn:
+        def call(self, *a, **k):
+            raise DBusError("org.freedesktop.DBus.Error.UnknownMethod", "Object does not exist")
+
+    b = SecretServiceBackend()
+    b._conn = Conn()
+    with pytest.raises(NotFound):
+        b._call("/item/1", "x", "Delete", vanishable=True)
+    with pytest.raises(BackendError):
+        b._call("/org/freedesktop/secrets", "x", "SearchItems")
+
+
+def test_item_order_is_creation_order():
+    from keychainlib.backends.secretservice import _item_order
+
+    paths = ["/c/login/12", "/c/login/x", "/c/login/2", "/c/login/100"]
+    assert sorted(paths, key=_item_order) == ["/c/login/2", "/c/login/12", "/c/login/100", "/c/login/x"]

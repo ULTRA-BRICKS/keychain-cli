@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1 — 2026-10-17
+
+- Linux: concurrent `keychain set` of the same ref no longer fails with an internal error
+  (found by the live E2E run: 4 of 10 parallel writers exited 1). Writers now converge on
+  the oldest item, tolerate items deleted under them, and retry; `delete` tolerates a
+  concurrent delete. A live test runs ten parallel writers.
+
 ## 0.1.0 — 2026-10-17
 
 First release.

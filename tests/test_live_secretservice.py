@@ -122,3 +122,19 @@ def test_locked_fails_fast_then_tty_unlock(collection, monkeypatch):
     assert b.get(Ref("kc-live", "lock")) == b"locked-value"
     b.delete(Ref("kc-live", "lock"))
     b.close()
+
+
+def test_concurrent_writers_converge_on_one_item(collection):
+    """Ten processes setting the same new ref at once: all succeed and one item remains."""
+    label = collection["label"]
+    env = {**scrubbed_env(os.environ), "KEYCHAIN_STORE": label}
+    procs = [subprocess.Popen([str(BIN), "set", "kc-live/race"], stdin=subprocess.PIPE,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env)
+             for _ in range(10)]
+    errors = [p.communicate(f"race-value-{i}".encode(), timeout=60)[1] for i, p in enumerate(procs)]
+    assert [p.returncode for p in procs] == [0] * 10, errors
+    b = SecretServiceBackend(collection=label)
+    assert len(b._find(Ref("kc-live", "race"))) == 1
+    assert b.get(Ref("kc-live", "race")).startswith(b"race-value-")
+    b.delete(Ref("kc-live", "race"))
+    b.close()

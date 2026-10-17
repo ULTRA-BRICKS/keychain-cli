@@ -57,6 +57,12 @@ UNAVAILABLE_FIX = (
 )
 
 
+def _item_order(path: str) -> tuple[int, str]:
+    """gnome-keyring numbers items in creation order (…/login/12); unknown shapes sort last."""
+    tail = path.rsplit("/", 1)[-1]
+    return (int(tail), path) if tail.isdigit() else (1 << 62, path)
+
+
 def has_display() -> bool:
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
@@ -106,6 +112,7 @@ class SecretServiceBackend:
         sig: str = "",
         args: list | None = None,
         timeout: float | None = None,
+        vanishable: bool = False,
     ) -> list:
         try:
             return self.conn.call(BUS, path, iface, member, sig, args, timeout=timeout)
@@ -117,6 +124,13 @@ class SecretServiceBackend:
                 raise BackendUnavailable(
                     "no Secret Service is running on the session bus", fix=UNAVAILABLE_FIX
                 ) from exc
+            if vanishable and exc.name in (
+                "org.freedesktop.DBus.Error.UnknownObject",
+                "org.freedesktop.DBus.Error.UnknownMethod",
+            ):
+                # Only for calls on an item path that a concurrent writer may have deleted:
+                # gnome-keyring answers this way for a path that no longer exists.
+                raise NotFound("the keyring item no longer exists", why=exc.name) from exc
             if exc.name == "org.freedesktop.Secret.Error.IsLocked":
                 raise Locked("the keyring is locked", fix="keychain unlock") from exc
             if exc.name == "org.freedesktop.Secret.Error.NoSuchObject":
@@ -128,8 +142,8 @@ class SecretServiceBackend:
             self.close()
             raise BackendUnavailable("the session bus connection failed", why=str(exc)) from exc
 
-    def _prop(self, path: str, iface: str, name: str):
-        return self._call(path, PROPS, "Get", "ss", [iface, name])[0]
+    def _prop(self, path: str, iface: str, name: str, vanishable: bool = False):
+        return self._call(path, PROPS, "Get", "ss", [iface, name], vanishable=vanishable)[0]
 
     @property
     def session(self) -> str:
@@ -226,15 +240,20 @@ class SecretServiceBackend:
     # ── our items ────────────────────────────────────────────────────────────
 
     def _find(self, ref: Ref) -> list[str]:
+        """Our items for ``ref``, oldest first, so concurrent writers agree on which one is kept."""
         attrs = {"xdg:schema": SCHEMA, "service": ref.service, "account": ref.account}
         candidates = self._call(self.collection(), COLLECTION, "SearchItems", "a{ss}", [attrs])[0]
-        # Re-check exactly: a provider that matches loosely (case-insensitively, by prefix)
-        # must not let `TG-CLI/x` act on `tg-cli/x`, which policy treats as another namespace.
-        return [
-            p
-            for p in candidates
-            if {k: v for k, v in self._prop(p, ITEM, "Attributes").items() if k in attrs} == attrs
-        ]
+        found = []
+        for p in candidates:
+            try:
+                item_attrs = self._prop(p, ITEM, "Attributes", vanishable=True)
+            except NotFound:
+                continue  # deleted by a concurrent writer between search and read
+            # Re-check exactly: a provider that matches loosely (case-insensitively, by prefix)
+            # must not let `TG-CLI/x` act on `tg-cli/x`, which policy treats as another namespace.
+            if {k: v for k, v in item_attrs.items() if k in attrs} == attrs:
+                found.append(p)
+        return sorted(found, key=_item_order)
 
     def _require(self, ref: Ref) -> str:
         found = self._find(ref)
@@ -245,28 +264,50 @@ class SecretServiceBackend:
     def get(self, ref: Ref) -> bytes:
         self._ensure_unlocked(self.collection(), f"reading {ref}")
         item = self._require(ref)
-        secret = self._call(item, ITEM, "GetSecret", "o", [self.session])[0]
+        try:
+            secret = self._call(item, ITEM, "GetSecret", "o", [self.session], vanishable=True)[0]
+        except NotFound as exc:  # deleted between search and read: same answer as "not there"
+            raise NotFound(f"no secret {ref}") from exc
         return bytes(secret[2])
 
     def set(self, ref: Ref, value: bytes, label: str | None, note: str | None) -> None:
         collection = self.collection()
         self._ensure_unlocked(collection, f"storing {ref}")
-        found = self._find(ref)
-        if found:
-            item = found[0]
-            self._call(item, ITEM, "SetSecret", "(oayays)", [self._secret_struct(value)])
-            attrs = dict(self._prop(item, ITEM, "Attributes"))
-            if note is not None:
-                if note:
-                    attrs["note"] = note
-                else:
-                    attrs.pop("note", None)
-                self._call(item, PROPS, "Set", "ssv", [ITEM, "Attributes", Variant("a{ss}", attrs)])
-            if label is not None:
-                self._call(item, PROPS, "Set", "ssv", [ITEM, "Label", Variant("s", label)])
-            for extra in found[1:]:  # duplicates written by another tool: keep exactly one
-                self._delete_item(extra, ref)
+        for _attempt in range(3):
+            found = self._find(ref)
+            if not found:
+                self._create(collection, ref, value, label, note)
+            else:
+                try:
+                    self._update(found[0], value, label, note)
+                except NotFound:
+                    continue  # the item vanished under a concurrent delete: start over
+            # Concurrent creates can leave several items; every writer keeps the oldest one, so
+            # they converge on exactly one item instead of deleting each other's. An update of a
+            # single existing item cannot have created a duplicate, so skip the second search.
+            if found and len(found) == 1:
+                return
+            for extra in self._find(ref)[1:]:
+                with contextlib.suppress(NotFound):
+                    self._delete_item(extra, ref)
             return
+        raise BackendError(f"storing {ref} kept racing with concurrent deletes")
+
+    def _update(self, item: str, value: bytes, label: str | None, note: str | None) -> None:
+        self._call(item, ITEM, "SetSecret", "(oayays)", [self._secret_struct(value)], vanishable=True)
+        if note is not None:
+            attrs = dict(self._prop(item, ITEM, "Attributes", vanishable=True))
+            if note:
+                attrs["note"] = note
+            else:
+                attrs.pop("note", None)
+            self._call(
+                item, PROPS, "Set", "ssv", [ITEM, "Attributes", Variant("a{ss}", attrs)], vanishable=True
+            )
+        if label is not None:
+            self._call(item, PROPS, "Set", "ssv", [ITEM, "Label", Variant("s", label)], vanishable=True)
+
+    def _create(self, collection: str, ref: Ref, value: bytes, label: str | None, note: str | None) -> None:
         attrs = {"xdg:schema": SCHEMA, "service": ref.service, "account": ref.account}
         if note:
             attrs["note"] = note
@@ -280,7 +321,7 @@ class SecretServiceBackend:
         self._complete_prompt(prompt, f"storing {ref}")
 
     def _delete_item(self, item: str, ref: Ref) -> None:
-        prompt = self._call(item, ITEM, "Delete")[0]
+        prompt = self._call(item, ITEM, "Delete", vanishable=True)[0]
         self._complete_prompt(prompt, f"deleting {ref}")
 
     def delete(self, ref: Ref) -> None:
@@ -289,10 +330,15 @@ class SecretServiceBackend:
         if not found:
             raise NotFound(f"no secret {ref}")
         for item in found:
-            self._delete_item(item, ref)
+            with contextlib.suppress(NotFound):  # a concurrent delete got there first
+                self._delete_item(item, ref)
 
     def _info(self, item: str) -> ItemInfo | None:
-        props = self._call(item, PROPS, "GetAll", "s", [ITEM])[0]
+        """Metadata of one of our items; None for foreign items and items deleted meanwhile."""
+        try:
+            props = self._call(item, PROPS, "GetAll", "s", [ITEM], vanishable=True)[0]
+        except NotFound:
+            return None
         attrs = props.get("Attributes", {})
         if attrs.get("xdg:schema") != SCHEMA or "service" not in attrs or "account" not in attrs:
             return None
@@ -356,7 +402,7 @@ class SecretServiceBackend:
         if self._prop(path, ITEM, "Attributes").get("xdg:schema") == SCHEMA:
             # Reading our own item by id would sidestep the namespace check on its ref.
             raise UsageError(f"system:{ident} is a keychain-cli item; address it by its service/account ref")
-        secret = self._call(path, ITEM, "GetSecret", "o", [self.session])[0]
+        secret = self._call(path, ITEM, "GetSecret", "o", [self.session], vanishable=True)[0]
         return bytes(secret[2])
 
     # ── unlock and status ────────────────────────────────────────────────────

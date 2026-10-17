@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hyper-keychain"
-version = "0.1.0"
+version = "0.1.1"
 description = "keychain — secrets for rig utilities from the OS keychain (macOS Keychain, Linux Secret Service): stdin-only input, exec injection, per-utility policy, value-free audit."
 readme = "README.md"
 requires-python = ">=3.11"
