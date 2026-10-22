@@ -28,7 +28,9 @@ class FakeBackend:
             raise NotFound(f"no secret {ref}")
         return self.items[ref][0]
 
-    def set(self, ref: Ref, value: bytes, label: str | None, note: str | None) -> None:
+    def set(
+        self, ref: Ref, value: bytes, label: str | None, note: str | None, origin: str | None = None
+    ) -> None:
         self._check()
         now = int(time.time())
         old = self.items.get(ref)
@@ -36,6 +38,7 @@ class FakeBackend:
             ref=ref,
             label=label if label is not None else (old[1].label if old else str(ref)),
             note=note if note is not None else (old[1].note if old else ""),
+            origin=origin if origin is not None else (old[1].origin if old else ""),
             created=old[1].created if old else now,
             modified=now,
         )
@@ -66,11 +69,19 @@ class FakeBackend:
                 out.append(item)
         return out
 
+    def system_info(self, ident: str) -> SystemItem:
+        if ident not in self.system:
+            raise NotFound(f"no system item {ident}")
+        return self.system[ident][1]
+
     def system_get(self, ident: str) -> bytes:
         self._check()
         if ident not in self.system:
             raise NotFound(f"no system item {ident}")
         return self.system[ident][0]
+
+    def ensure_unlocked(self, what: str, system_id: str | None = None) -> None:
+        self._check()
 
     def unlock(self, create: bool = False) -> str:
         self.locked = False

@@ -130,3 +130,11 @@ def test_item_order_is_creation_order():
 
     paths = ["/c/login/12", "/c/login/x", "/c/login/2", "/c/login/100"]
     assert sorted(paths, key=_item_order) == ["/c/login/2", "/c/login/12", "/c/login/100", "/c/login/x"]
+
+
+def test_malformed_bus_address_is_unavailable():
+    from keychainlib.backends.secretservice import SecretServiceBackend
+    from keychainlib.errors import BackendUnavailable
+
+    with pytest.raises(BackendUnavailable):
+        _ = SecretServiceBackend(address="unix:path=/run/%zzbus").conn

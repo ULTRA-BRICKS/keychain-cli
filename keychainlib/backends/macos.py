@@ -66,6 +66,11 @@ def parse_items(dump: str) -> list[dict]:
             value = decode_buffer(m.group("val"))
             if value is not None and m.group("fmt") in ("blob", "string"):
                 current["attrs"][tag] = value.decode("utf-8", "replace").rstrip("\x00")
+            elif value is not None and m.group("fmt") == "uint32" and tag in ("ptcl", "port"):
+                # An internet password's site: `"ptcl"<uint32>="htps"`, `"port"<uint32>=0x000001BB`.
+                current["attrs"][tag] = (
+                    value.decode("latin-1") if tag == "ptcl" else str(int.from_bytes(value, "big"))
+                )
     return items
 
 
@@ -149,7 +154,9 @@ class MacOSBackend:
             raise NotFound(f"no secret {ref}")
         return attrs
 
-    def set(self, ref: Ref, value: bytes, label: str | None, note: str | None) -> None:
+    def set(
+        self, ref: Ref, value: bytes, label: str | None, note: str | None, origin: str | None = None
+    ) -> None:
         try:
             old = self.info(ref)
         except NotFound:
@@ -168,6 +175,7 @@ class MacOSBackend:
                 )
         label = label if label is not None else (old.label if old else str(ref))
         note = note if note is not None else (old.note if old else "")
+        origin = origin if origin is not None else (old.origin if old else "")
         parts = [
             "add-generic-password",
             "-U",
@@ -180,8 +188,12 @@ class MacOSBackend:
             "-l",
             _q(label),
         ]
-        if note:
+        # `-U` keeps attributes it is not given, so clearing a note or an origin writes an
+        # explicit empty value. The generic attribute (`gena`) holds the origin.
+        if note or (old and old.note):
             parts += ["-j", _q(note)]
+        if origin or (old and old.origin):
+            parts += ["-G", _q(origin)]
         parts += ["-X", bytes(value).hex()]
         if self.keychain:
             parts.append(_q(self.keychain))
@@ -218,7 +230,9 @@ class MacOSBackend:
             ref = Ref(attrs["svce"], attrs["acct"])
         except Exception:  # noqa: BLE001
             return None
-        return ItemInfo(ref=ref, label=attrs.get("labl", ""), note=attrs.get("icmt", ""))
+        return ItemInfo(
+            ref=ref, label=attrs.get("labl", ""), note=attrs.get("icmt", ""), origin=attrs.get("gena", "")
+        )
 
     def _dump(self) -> list[dict]:
         proc = self._run(["dump-keychain", *self._kc()], what="listing the keychain")
@@ -265,6 +279,12 @@ class MacOSBackend:
             )
         return sorted(out, key=lambda s: s.id)
 
+    def system_info(self, ident: str) -> SystemItem:
+        for item in self.system_list({}):
+            if item.id == ident:
+                return item
+        raise NotFound(f"no system item {ident}", fix="ids come from `keychain system list`")
+
     def system_get(self, ident: str) -> bytes:
         kind, _, rest = ident.partition(":")
         host, sep, acct = rest.partition("/")
@@ -281,6 +301,10 @@ class MacOSBackend:
             # Reading our own item by id would sidestep the namespace check on its ref.
             raise UsageError(f"system:{ident} is a keychain-cli item; address it by its service/account ref")
         return _password_from_stderr(proc.stderr.decode("utf-8", "replace"))
+
+    def ensure_unlocked(self, what: str, system_id: str | None = None) -> None:
+        """Nothing to do: `security` lists item attributes of a locked keychain and asks for the
+        unlock only when a secret is read."""
 
     def unlock(self, create: bool = False) -> str:
         if create:

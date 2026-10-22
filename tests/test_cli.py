@@ -212,3 +212,38 @@ def test_policy_check_command(h, capsys):
 def test_system_caller_at_parent_level_is_honoured(h):
     h.backend.add_system("login/9", b"vvvv", "x", {})
     assert h.run(["system", "get", "login/9", "--reveal", "--caller", "tool"]) == 8
+
+
+def test_set_origin_is_normalized_kept_and_removable(h, capsys):
+    ref = Ref("tg-cli", "bot-token")
+    assert h.run(["set", REF, "--origin", "https://GitHub.com/login?x=1"], stdin=b"v1") == 0
+    assert h.backend.info(ref).origin == "https://github.com"
+    assert h.run(["set", REF], stdin=b"v2") == 0
+    assert h.backend.info(ref).origin == "https://github.com"
+    capsys.readouterr()
+    assert h.run(["info", REF, "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["origin"] == "https://github.com"
+    assert h.run(["set", REF, "--origin", ""], stdin=b"v3") == 0
+    assert h.backend.info(ref).origin == ""
+
+
+def test_set_rejects_a_bad_origin_before_reading_the_value(h):
+    assert h.run(["set", REF, "--origin", "github.com"], stdin=SECRET.encode()) == 2
+    assert h.backend.items == {}
+
+
+def test_fill_needs_a_field_and_a_loopback_endpoint(h, capsys):
+    import pytest
+
+    with pytest.raises(SystemExit) as exc:
+        h.run(["fill", REF, "--cdp", "http://127.0.0.1:9222"])
+    assert exc.value.code == 2
+    assert h.run(["fill", REF, "--cdp", "http://198.51.100.7:9222", "--selector", "#pw"]) == 8
+    assert h.run(["fill", REF, "--cdp", "http://127.0.0.1:9", "--selector", "#pw"]) == 5
+    assert h.run(["capture", REF, "--cdp", "http://127.0.0.1:9", "--focused", "--caller", "x"]) == 8
+    outcomes = [(e["op"], e["outcome"]) for e in h.audit.tail(10)]
+    assert outcomes == [
+        ("fill", "PolicyDenied"),
+        ("fill", "BackendUnavailable"),
+        ("capture", "PolicyDenied"),
+    ]

@@ -15,11 +15,12 @@ import sys
 import time
 from collections.abc import Callable
 
-from . import __version__
+from . import __version__, approval
 from .api import Keychain
 from .audit import Audit
 from .backends import SAFE_SYSTEM_ATTRIBUTES
 from .errors import EXIT_CODES, EXIT_INTERNAL, EXIT_OK, KeychainError, UsageError
+from .origins import normalize_origin
 from .policy import READ, WRITE, Policy, policy_path
 from .refs import SystemRef, parse_item_ref, parse_ref, valid_service
 
@@ -85,6 +86,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--raw", action="store_true", help="keep stdin byte-exact (default strips one trailing newline)"
     )
+    p.add_argument(
+        "--origin",
+        help="the website this credential belongs to (https://site.tld); `fill` types it "
+        "only there. An empty string removes it",
+    )
 
     p = add("get", "print a secret to stdout (needs --reveal); prefer `exec`")
     p.add_argument("ref")
@@ -105,6 +111,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not mask injected values in the command's output (TTY passthrough)",
     )
     p.add_argument("cmd", nargs=argparse.REMAINDER, help="-- command [args...]")
+
+    def browser_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument("ref")
+        p.add_argument(
+            "--cdp",
+            required=True,
+            metavar="URL",
+            help="DevTools endpoint on loopback: http://127.0.0.1:PORT or ws://127.0.0.1:PORT/devtools/browser/…",
+        )
+        where = p.add_mutually_exclusive_group(required=True)
+        where.add_argument("--selector", metavar="CSS", help="the field (document.querySelector syntax)")
+        where.add_argument("--focused", action="store_true", help="the field that has keyboard focus")
+        p.add_argument("--target", metavar="ID", help="the tab's CDP target id (default: the only match)")
+        p.add_argument("--origin", help="also require the field's page to have exactly this origin")
+
+    p = add("fill", "type a credential into a browser field over CDP (the value is never printed)")
+    browser_args(p)
+    p.add_argument("--field", choices=["password", "username"], default="password")
+
+    p = add("capture", "store a browser field's value over CDP, bound to the page's origin")
+    browser_args(p)
+    p.add_argument("--label", help="human-readable label (one line)")
 
     p = add("exists", "exit 0 if the secret exists, 4 if not")
     p.add_argument("ref")
@@ -206,9 +234,24 @@ def _ts(value: int | None) -> str:
 
 def cmd_set(kc: Keychain, a: argparse.Namespace) -> int:
     ref = parse_item_ref(a.ref)
+    origin = normalize_origin(a.origin) if a.origin else a.origin  # reject before the prompt
     kc.authorize("set", [ref], WRITE)  # refuse before asking for the value
-    kc.set(ref, _read_value(str(ref), a.raw), label=a.label, note=a.note)
+    kc.set(ref, _read_value(str(ref), a.raw), label=a.label, note=a.note, origin=origin)
     print(f"stored {ref}", file=sys.stderr)
+    return EXIT_OK
+
+
+def cmd_fill(kc: Keychain, a: argparse.Namespace) -> int:
+    selector = None if a.focused else a.selector
+    result = kc.fill(a.ref, a.cdp, selector, field=a.field, origin=a.origin, target=a.target)
+    print(json.dumps(result, ensure_ascii=False))
+    return EXIT_OK
+
+
+def cmd_capture(kc: Keychain, a: argparse.Namespace) -> int:
+    selector = None if a.focused else a.selector
+    result = kc.capture(a.ref, a.cdp, selector, label=a.label, origin=a.origin, target=a.target)
+    print(json.dumps(result, ensure_ascii=False))
     return EXIT_OK
 
 
@@ -262,6 +305,7 @@ def cmd_info(kc: Keychain, a: argparse.Namespace) -> int:
     else:
         print(
             f"ref:      {info.ref}\nlabel:    {info.label}\nnote:     {info.note}\n"
+            f"origin:   {info.origin or '-'}\n"
             f"created:  {_ts(info.created)}\nmodified: {_ts(info.modified)}"
         )
     return EXIT_OK
@@ -351,8 +395,16 @@ def cmd_policy(kc: Keychain, a: argparse.Namespace) -> int:
         "owns SERVICE/* where SERVICE is its name; other refs need [callers.<name>] "
         "read/write globs."
     )
+    command, source = approval.resolve_command(kc.policy.approval_cmd, agent=kc.agent)
+    print(
+        f"fill approval: `{' '.join(command)}` (from {source}), "
+        f"{kc.policy.approval_timeout}s; asked for every caller but `user` unless approve = false"
+    )
     for name, grant in sorted(kc.policy.callers.items()):
-        print(f"  [{name}] read={list(grant.read)} write={list(grant.write)} reveal={grant.reveal}")
+        print(
+            f"  [{name}] read={list(grant.read)} write={list(grant.write)} "
+            f"reveal={grant.reveal} fill={list(grant.fill)} approve={grant.approve}"
+        )
     return EXIT_OK
 
 
@@ -381,6 +433,8 @@ COMMANDS: dict[str, Callable[[Keychain, argparse.Namespace], int]] = {
     "get": cmd_get,
     "exec": cmd_exec,
     "exists": cmd_exists,
+    "fill": cmd_fill,
+    "capture": cmd_capture,
     "delete": cmd_delete,
     "info": cmd_info,
     "list": cmd_list,

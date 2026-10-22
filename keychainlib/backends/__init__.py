@@ -24,6 +24,7 @@ SAFE_SYSTEM_ATTRIBUTES = frozenset(
         "application",
         "type",
         "url",
+        "URL",  # KeePassXC
         "uri",
         "server",
         "host",
@@ -60,6 +61,7 @@ class ItemInfo:
     ref: Ref
     label: str = ""
     note: str = ""
+    origin: str = ""  # the website this credential belongs to (`keychain fill` checks it)
     created: int | None = None
     modified: int | None = None
 
@@ -70,6 +72,7 @@ class ItemInfo:
             "account": self.ref.account,
             "label": self.label,
             "note": self.note,
+            "origin": self.origin,
             "created": self.created,
             "modified": self.modified,
         }
@@ -97,17 +100,21 @@ class Backend(Protocol):
     name: str
 
     def get(self, ref: Ref) -> bytes: ...
-    def set(self, ref: Ref, value: bytes, label: str | None, note: str | None) -> None: ...
+    def set(
+        self, ref: Ref, value: bytes, label: str | None, note: str | None, origin: str | None = None
+    ) -> None: ...
     def delete(self, ref: Ref) -> None: ...
     def info(self, ref: Ref) -> ItemInfo: ...
     def list(self, service: str | None = None) -> list[ItemInfo]: ...
     def system_list(self, query: dict[str, str]) -> list[SystemItem]: ...
+    def system_info(self, ident: str) -> SystemItem: ...
     def system_get(self, ident: str) -> bytes: ...
     def unlock(self, create: bool = False) -> str: ...
+    def ensure_unlocked(self, what: str, system_id: str | None = None) -> None: ...
     def status(self) -> dict: ...
 
 
-_URL_ATTRIBUTES = frozenset({"url", "uri", "origin_url", "action_url", "signon_realm"})
+_URL_ATTRIBUTES = frozenset({"url", "URL", "uri", "origin_url", "action_url", "signon_realm"})
 
 
 def _strip_url(value: str) -> str:

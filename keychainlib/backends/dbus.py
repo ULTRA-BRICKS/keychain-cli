@@ -358,7 +358,10 @@ def _unescape_address(value: str) -> str:
     out, i = [], 0
     while i < len(value):
         if value[i] == "%" and i + 2 < len(value):
-            out.append(chr(int(value[i + 1 : i + 3], 16)))
+            try:
+                out.append(chr(int(value[i + 1 : i + 3], 16)))
+            except ValueError:  # a malformed address is "no bus", not an internal error
+                raise DBusConnectionError("malformed escape in the bus address") from None
             i += 3
         else:
             out.append(value[i])

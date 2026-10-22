@@ -18,10 +18,10 @@ EXIT_MISSING_DEP = 127
 EXIT_CODES = {
     EXIT_OK: "success",
     EXIT_INTERNAL: "internal error (a bug or an unexpected store reply)",
-    EXIT_USAGE: "invalid arguments or malformed policy",
+    EXIT_USAGE: "invalid arguments or malformed policy; fill: no single matching field",
     EXIT_NOT_FOUND: "no such secret",
-    EXIT_UNAVAILABLE: "no secret store reachable (Secret Service / Keychain)",
-    EXIT_DENIED: "access denied (policy, or the user declined a prompt)",
+    EXIT_UNAVAILABLE: "no secret store reachable (Secret Service / Keychain); fill: no browser",
+    EXIT_DENIED: "access denied (policy, a declined prompt; fill: origin, field type, TLS)",
     EXIT_LOCKED: "the keyring is locked; run `keychain unlock`",
     EXIT_MISSING_DEP: "a required system tool is missing",
 }

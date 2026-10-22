@@ -55,6 +55,15 @@ def test_metadata_list_and_update_preserves_label(mac):
     assert [str(i.ref) for i in mac.list("x")] == ["x/y"]
 
 
+def test_origin_is_kept_and_both_note_and_origin_can_be_cleared(mac):
+    ref = Ref("site", "alex")
+    mac.set(ref, b"pw-1", None, "note", "https://site.tld")
+    mac.set(ref, b"pw-2", None, None)
+    assert (mac.info(ref).note, mac.info(ref).origin) == ("note", "https://site.tld")
+    mac.set(ref, b"pw-3", None, "", "")
+    assert (mac.info(ref).note, mac.info(ref).origin) == ("", "")
+
+
 def test_not_found_and_delete(mac):
     ref = Ref("a", "b")
     with pytest.raises(NotFound):

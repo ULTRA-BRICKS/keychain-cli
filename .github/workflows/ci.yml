@@ -34,9 +34,43 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install pytest
-      # Fake backend + fake `security` (macOS) + D-Bus marshalling. The live Secret Service
-      # tests skip here (KEYCHAIN_LIVE unset): the runner has no session bus or keyring.
+      # Fake backend + fake `security` (macOS) + D-Bus marshalling. The live and integration
+      # tests skip here (KEYCHAIN_LIVE / KEYCHAIN_INTEGRATION unset): no session bus or keyring.
       - run: python -m pytest -q
+
+  integration:
+    name: integration (gnome-keyring + Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install gnome-keyring, D-Bus and Chromium
+        # Ubuntu ships Chromium only as a snap, which does not run here: it comes from
+        # Playwright (a CI-only tool; keychain-cli itself stays stdlib-only).
+        run: |
+          set -euo pipefail
+          SUDO=$(command -v sudo || true)
+          $SUDO apt-get update -qq
+          $SUDO apt-get install -y -qq --no-install-recommends \
+            gnome-keyring dbus-daemon util-linux curl openssl
+          pip install pytest 'playwright>=1.50,<2'
+          python -m playwright install --with-deps chromium
+      - name: Integration and live tests under a private session bus
+        # `--unlock` reads a throwaway password from stdin; the tests create, use and delete
+        # their own collections. -rs prints the reason of every skipped test.
+        run: |
+          set -euo pipefail
+          export XDG_RUNTIME_DIR="$(mktemp -d)"
+          # The runner's Chromium may have no usable sandbox (unprivileged user namespaces off).
+          export KEYCHAIN_TEST_CHROME_NO_SANDBOX=1
+          dbus-run-session -- sh -ec '
+            head -c 24 /dev/urandom | base64 | gnome-keyring-daemon --unlock --components=secrets \
+              --daemonize >/dev/null
+            KEYCHAIN_INTEGRATION=1 KEYCHAIN_LIVE=1 python -m pytest -q -rs -m "integration or live"
+          '
 
   secret-scan:
     name: gitleaks (block on secrets)

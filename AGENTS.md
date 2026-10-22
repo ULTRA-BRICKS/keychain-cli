@@ -42,8 +42,13 @@ keychainlib/policy.py         callers, namespaces, grants, reveal rules
 keychainlib/context.py        caller resolution, agent-session detection
 keychainlib/execution.py      exec: env/stdin injection, streaming redaction
 keychainlib/audit.py          value-free JSONL journal
-keychainlib/backends/         secretservice.py (+ dbus.py), macos.py, fake.py
+keychainlib/browser.py        fill/capture: field lookup, origin checks, typing over CDP
+keychainlib/cdp.py            stdlib CDP client (WebSocket), loopback + same-uid endpoints only
+keychainlib/origins.py        web origins and the credential-to-page binding rule
+keychainlib/approval.py       the replaceable human-approval command asked before every fill
+keychainlib/backends/         secretservice.py (+ dbus.py, reflock.py), macos.py, fake.py
 keychainlib/SKILL.md          the agent skill `keychain install-skill` writes
+tests/integration/            real binary + gnome-keyring + Chromium (KEYCHAIN_INTEGRATION=1)
 ```
 
 ## Release
@@ -54,5 +59,8 @@ on each machine, then `keychain install-skill` if `SKILL.md` changed.
 
 ## Verify
 
-`python3 -m pytest -q`, `KEYCHAIN_LIVE=1 python3 -m pytest -q -m live` on a Linux desktop,
-`ruff check .`.
+`python3 -m pytest -q`, `KEYCHAIN_LIVE=1 python3 -m pytest -q -m live` and
+`KEYCHAIN_INTEGRATION=1 python3 -m pytest -q -rs tests/integration` on a Linux desktop (the
+fill tests find Chrome/Chromium on PATH, in Playwright's cache, or via `KEYCHAIN_TEST_CHROME`),
+`ruff check .`. Any new path a value can take (fill, capture) needs a test asserting the value
+is absent from stdout, stderr and the journal.

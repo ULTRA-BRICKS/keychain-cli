@@ -25,10 +25,12 @@ secret. A D-Bus client of about 400 lines is small enough to review.
   `[A-Za-z0-9._-]` for the service and `[A-Za-z0-9._@+:-]` for the account; neither may
   start with `.` or `-`.
 - Linux: the item has the attributes `xdg:schema=ai.hyperide.keychain`, `service`, `account`
-  and an optional `note`. It lives in the default collection, or in `--store` (a collection
-  label or id).
+  and optional `note` and `origin`. It lives in the default collection, or in `--store` (a
+  collection label or id).
 - macOS: the item is a generic password with service `service`, account `account` and kind
-  (`-D`) `keychain-cli`. The label and the note map to the keychain's label and comment.
+  (`-D`) `keychain-cli`. The label and the note map to the keychain's label and comment; the
+  origin to the generic attribute (`-G`, `gena`).
+- `origin` (`https://host[:port]`) binds a credential to a website for `keychain fill`.
 - A system item is anything another app stored: website passwords (synced by passwords-app,
   stored by browsers), Wi-Fi passwords, app tokens. It is addressed as `system:<id>`, using
   the id that `keychain system list` prints. On Linux the id is `<collection>/<item>`, for
@@ -38,10 +40,13 @@ secret. A D-Bus client of about 400 lines is small enough to review.
 ## Commands
 
 ```
-keychain set REF [--label L] [--note N] [--raw]   value from stdin or a hidden TTY prompt
+keychain set REF [--label L] [--note N] [--origin URL] [--raw]   value from stdin or a TTY prompt
 keychain get REF --reveal                         value to stdout (no newline unless a TTY)
 keychain exec [--env NAME=REF]... [--stdin REF] [--no-redact] -- CMD...
 keychain exists REF | delete REF | info REF [--json] | list [SERVICE] [--json]
+keychain fill REF --cdp URL (--selector CSS | --focused) [--field password|username]
+              [--origin URL] [--target TAB]       type it into a browser field (see Browser)
+keychain capture REF --cdp URL (--selector CSS | --focused) [--label L] [--origin URL] [--target TAB]
 keychain system list [--attr K=V]... [--match TEXT] [--json] | system get ID --reveal
 keychain unlock [--create] | doctor [--json] | policy [REF [--op read|write]] | audit [-n N]
 keychain install-skill | --version
@@ -51,9 +56,9 @@ common: --caller NAME, --store NAME, --no-prompt
 Exit codes follow the agent-tools contract: 0 ok, 1 internal error, 2 usage, 4 not found,
 5 no store reachable, 8 denied, 127 missing tool. keychain-cli adds 9: the store is locked.
 
-The library API is `Keychain(caller).get/set/delete/exists/info/list/system_list`. `get`
-returns a `Secret`, which prints as `Secret(***)` and refuses to be pickled. The value comes
-out only through `.reveal()`.
+The library API is `Keychain(caller).get/set/delete/exists/info/list/system_list/fill/capture`.
+`get` returns a `Secret`, which prints as `Secret(***)` and refuses to be pickled. The value
+comes out only through `.reveal()`.
 
 ## Security model
 
@@ -100,6 +105,10 @@ going around it.
      allowed for `agent` or `user`. Owning a namespace is not enough, because any process
      can claim a utility's name with `--caller`. Only the human edits the policy file.
      Redacted `exec` needs only read access.
+   - `fill` needs a `fill` grant naming the page's origin for every caller but `user`
+     (Browser section). It does not need `reveal`: the value goes into the page.
+   - Every `fill` by a caller other than `user` is confirmed by a human first, through the
+     replaceable approval command (Browser section, "Approval").
    - `exec` removes `KEYCHAIN_CALLER` from the child's environment, so a child does not
      inherit its parent's identity.
    - Lookups re-check `service`/`account` exactly. A store that matches loosely (for
@@ -109,7 +118,8 @@ going around it.
    `GEMINI_CLI`, `CURSOR_AGENT`, `PI_CODING_AGENT`. `KEYCHAIN_AGENT=1` forces agent mode;
    nothing switches a detected harness back to human mode. An agent session cannot claim
    the `user` caller.
-6. **Audit.** Every get, set, delete, info, list, system access and exec is appended to
+6. **Audit.** Every get, set, delete, info, list, system access, exec, fill and capture (with
+   the page's origin and the selector) is appended to
    `~/.local/state/keychain-cli/audit.jsonl` (directory 0700, file 0600). This includes
    refusals and a `get` without `--reveal`. Each line records the time, operation, ref,
    caller, agent flag, outcome, pid, parent pid and parent process name. Values are never
@@ -136,8 +146,126 @@ going around it.
 
 Environment variables read: `KEYCHAIN_CALLER`, `KEYCHAIN_STORE`, `KEYCHAIN_NO_PROMPT`,
 `KEYCHAIN_AGENT`, `KEYCHAIN_DEBUG`, `XDG_CONFIG_HOME` (policy), `XDG_STATE_HOME` (audit),
-`DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR` (Linux bus), and the agent markers above.
-A harness hook that wants to pin an agent's configuration strips these.
+`DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR` (Linux bus, write locks), `KEYCHAIN_FILL_TEST`
+(loopback test pages for `fill`, see Browser), `KEYCHAIN_APPROVAL_CMD` (the approval command,
+outside agent sessions only), and the agent markers above. A harness hook that
+wants to pin an agent's configuration strips these.
+
+## Concurrent writers
+
+The Secret Service has no compare-and-set: two processes that search for a ref, find nothing
+and create it leave two items. Writers of one ref therefore take an exclusive `flock` on
+`$XDG_RUNTIME_DIR/keychain-cli/<sha256(collection, service, account)>.lock` (falling back to
+`/run/user/<uid>`, then a private directory in the temp dir; the directory must be 0700 and
+ours). `set` and `delete` hold it around search-and-write, so every keychain-cli writer on the
+machine is serialized. Writers the lock cannot see (another app, another machine syncing the
+same collection) are still folded: after a create, every writer keeps the oldest item and
+deletes the rest. macOS `add-generic-password -U` is a single keychain call.
+
+## Browser
+
+`keychain fill` types a credential into a field of a Chromium-family browser over the Chrome
+DevTools Protocol (CDP); `keychain capture` stores a field's value. Both run in the keychain
+process with a stdlib CDP client (WebSocket over a socket), so the value travels store → the
+checked element's `value` (`Runtime.callFunctionOn` on that element, then `input`/`change`
+events; not `Input.insertText`, which goes to whatever has focus when it arrives) or field →
+store, and never through argv, stdout, logs, the audit journal or an agent's context. stdout
+carries only `{"filled":true,"selector":…,"origin":…}` or
+`{"captured":true,"ref":…,"origin":…}`.
+
+- **Endpoint.** `--cdp` is `http://127.0.0.1:PORT` (resolved through `/json/version`) or the
+  browser's `ws://127.0.0.1:PORT/devtools/browser/…` URL. Only loopback hosts are accepted; on
+  Linux the process listening on that TCP connection must run as our uid (from
+  `/proc/net/tcp`), so another user cannot pose as a browser and receive values. macOS has no
+  such check.
+- **Which field.** `--selector` is looked up in every frame of every tab (cross-site iframes
+  through auto-attached child sessions), `--focused` follows `document.activeElement` into
+  frames. Exactly one match is required, counting several matches inside one frame too (exit 2
+  otherwise, also for an empty field to capture);
+  `--target` picks a tab (it needs a DevTools URL: a session object is one tab). Lookups run
+  in an isolated world, so page scripts cannot redefine `querySelector` or the element's
+  properties for us; frame URLs come from the browser's frame tree, not `document.URL`.
+- **Origin binding (phishing).** The credential's origin is its `origin` attribute, or for a
+  `system:` item the first of `url`, `URL` (KeePassXC), `origin_url`, `signon_realm`, `uri`
+  that parses, or a macOS internet password's protocol, server and port; a credential without
+  one is refused. Hosts are compared in punycode, as the browser reports them; an
+  internationalized name whose punycode Python and the browser would spell differently
+  (`ß`, `ς`, joiners, compatibility characters) is refused rather than guessed. The field's
+  frame and every frame above it up to the top must be https, with the credential's scheme and
+  port, on the credential's host or a subdomain of it. There is no
+  Public Suffix List (none in the stdlib, and a vendored one goes stale); instead a subdomain is
+  reachable only when the `fill` grant names it. `--origin` additionally requires an exact
+  origin; it cannot widen anything. The tab's TLS state (`Security.visibleSecurityStateChanged`)
+  must not report a certificate error, which catches browsers started with
+  `--ignore-certificate-errors` or a clicked-through interstitial.
+- **Policy.** `[callers.X] fill = ["https://site.tld", "https://*.site.tld"]` lists origins
+  (globs) caller X may fill into; every frame origin above must match. Grants are read in that
+  form (lowercase, punycode, no trailing slash or default port); one that is not
+  `scheme://host[:port]` makes the policy file invalid. Owning a namespace does
+  not grant fill. The caller also needs the read right on the ref (own namespace or a `read`
+  grant; `system:` patterns for system items): the agent that drives the browser can read a
+  filled field back over CDP, so fill is no stronger a boundary than read. What fill adds is
+  the site binding and keeping the value out of the transcript by default. `user` (a human
+  outside an agent session) needs no grant but gets only the credential's exact host. The
+  policy and the frames are checked before the store is touched; the frames are checked again
+  right before writing. The store is unlocked (or exit 9) before the credential's origin is
+  looked up, so a locked store never looks like a missing credential.
+- **Approval (a replaceable human channel).** keychain does not know how to reach a person:
+  it runs a command. The default is tg-cli's blocking question, `tg-ctl ask`; any component
+  that can ask a human and report the answer by exit status can replace it, so nothing in
+  keychain is tied to Telegram. Every fill by a caller other than `user` is confirmed this
+  way, after the page and the credential have been checked against each other (nobody is asked
+  about a fill that would be refused anyway) and before the value is fetched from the store.
+  The page is checked again after the answer, which may take minutes.
+  - *Which command*, first match wins: `approval_cmd` in the policy file (a string split like
+    a shell line, without a shell, or a list of strings); `KEYCHAIN_APPROVAL_CMD` in the
+    environment, ignored inside agent sessions because an agent that could set it would approve
+    itself; `tg-ctl ask`. `approval_timeout` (seconds, 1–900, default 300) bounds the wait. A
+    future resolver (rig providers) supplies the command in the first two places.
+  - *Contract.* argv is the command plus one argument, the prompt: one sentence naming the
+    caller, the ref, the origin and the field kind, never a value (the selector is left out,
+    since the agent chooses it). The environment gets `KEYCHAIN_APPROVAL_TIMEOUT` (seconds), and
+    `KEYCHAIN_APPROVAL_CALLER`, `KEYCHAIN_APPROVAL_REF`, `KEYCHAIN_APPROVAL_ORIGIN` for
+    channels that want data instead of a sentence. stdin is empty, stdout and stderr are
+    discarded. Exit status 0 is approval; anything else, including a timeout (the command is
+    killed after the timeout plus 15 s) or a crash, is a refusal: exit 8 `did not approve`.
+    A missing or non-executable command is exit 127. The default command additionally gets
+    `--timeout SEC`, which is how `tg-ctl ask` takes its limit.
+  - *Exemption.* `[callers.X] approve = false` skips the question for that caller. Only the
+    human edits the policy file; `user` is a human at a terminal and is never asked.
+  - *Audit.* The `fill` entry carries `approval`: `approved`, `asked via <source>` (refused or
+    failed) or `not required`.
+  - *Trust.* The approver is found through the same `PATH` the caller has, and a process with
+    our uid can replace it: approval protects against an agent acting on its own (a
+    prompt-injected one included) and against mistakes, not against hostile code running as the
+    user, which this tool never claimed to stop (see the first paragraph). The approver gets
+    our environment minus `KEYCHAIN_CALLER`.
+- **Field.** Password: `<input type=password>`, enabled, writable, not `visibility:hidden`,
+  with a layout box, and accepting focus. Username (`--field username`): `type=text|email`
+  with `autocomplete` containing `username` or `email` (or `type=email`). The old content is
+  selected and replaced. Afterwards the field must still be `type=password` (a script that
+  flips it to `text` would expose the value on screenshots) and hold exactly as many characters
+  as were typed; otherwise it is cleared and the command fails. The value is never read back.
+  The checks run again after the approval wait, and the write itself refuses (inside the
+  browser, in the same call) a field that became disabled, read-only or no longer a masked
+  password. If the stored item was replaced meanwhile (value and site change together), the fill
+  is refused rather than typing the new value under the old origin's checks. The login name is
+  its own ref: a ref holds one value, and `--field username` only changes what the field must be.
+- **Capture.** Needs the write right on REF. The field (`<input>` or `<textarea>`) must be on
+  an https page and hold at most 64 KiB; the stored item is bound to the field's frame origin,
+  or keeps its existing binding when that site (or a parent of the page's host) already owns
+  it, so capturing on a subdomain does not narrow it. An existing item bound to another site is
+  not overwritten; the binding is read again right before the write, which narrows (a lock
+  across the browser round trip would not be sound) but does not close a concurrent writer's window.
+- **Test pages.** With `KEYCHAIN_FILL_TEST=1`, loopback pages (`localhost`, `*.localhost`,
+  `127.0.0.0/8`, `::1`) may be plain http or carry a self-signed certificate. Nothing else is
+  relaxed, so the variable cannot open a real site to an insecure page.
+- **Out of scope.** The page's own scripts can read a field they own; the site is the user's
+  trusted site. TLS state is read once per fill (fail closed when the browser does not report
+  it; a Playwright session needs `on(event, handler)` for that). Playwright's CDP
+  session (`page.context.new_cdp_session(page)`) reaches only frames in the page's own process,
+  so cross-site iframes are not found through it. Exit codes: 2 no or several fields, 4 no
+  credential, 5 no browser, 8 refused (policy, origin, field, TLS), 9 locked store.
 
 ## Locked stores and headless sessions
 

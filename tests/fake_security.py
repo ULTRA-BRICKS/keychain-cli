@@ -49,7 +49,10 @@ def fail(msg: str, rc: int) -> int:
 
 
 NOT_FOUND = "SecKeychainSearchCopyNext: The specified item could not be found in the keychain."
-ATTRS = {"genp": ["acct", "desc", "icmt", "labl", "svce"], "inet": ["acct", "labl", "ptcl", "srvr"]}
+ATTRS = {
+    "genp": ["acct", "desc", "gena", "icmt", "labl", "svce"],
+    "inet": ["acct", "labl", "ptcl", "srvr"],
+}
 
 
 def show(item: dict) -> None:
@@ -59,7 +62,7 @@ def show(item: dict) -> None:
     print("attributes:")
     for key in ATTRS[item["class"]]:
         value = item.get(key)
-        tag = "0x00000007 " if key == "labl" else f'"{key}"'
+        tag = {"labl": "0x00000007 ", "gena": "0x00000008 "}.get(key, f'"{key}"')
         rendered = "<NULL>" if value is None else print_buffer(value.encode())
         print(f"    {tag}<blob>={rendered}")
 
@@ -88,10 +91,13 @@ def command(argv: list[str]) -> int:
                 "acct": o["-a"],
                 "desc": o.get("-D"),
                 "labl": o.get("-l", o["-s"]),
-                "icmt": o.get("-j"),
                 "data": data.hex(),
             }
         )
+        # like `security -U`: an attribute that is not given keeps its old value
+        for flag, key in (("-j", "icmt"), ("-G", "gena")):
+            if flag in o:
+                item[key] = o[flag] or None
         if not existing:
             items.append(item)
         save(items)

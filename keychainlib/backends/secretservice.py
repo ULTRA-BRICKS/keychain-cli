@@ -35,6 +35,7 @@ from ..errors import (
 from ..refs import Ref
 from . import ItemInfo, SystemItem, safe_attributes
 from .dbus import Connection, DBusConnectionError, DBusError, Variant
+from .reflock import ref_lock
 
 BUS = "org.freedesktop.secrets"
 SERVICE_PATH = "/org/freedesktop/secrets"
@@ -270,47 +271,59 @@ class SecretServiceBackend:
             raise NotFound(f"no secret {ref}") from exc
         return bytes(secret[2])
 
-    def set(self, ref: Ref, value: bytes, label: str | None, note: str | None) -> None:
+    def set(
+        self,
+        ref: Ref,
+        value: bytes,
+        label: str | None,
+        note: str | None,
+        origin: str | None = None,
+    ) -> None:
         collection = self.collection()
         self._ensure_unlocked(collection, f"storing {ref}")
-        for _attempt in range(3):
-            found = self._find(ref)
-            if not found:
-                self._create(collection, ref, value, label, note)
-            else:
-                try:
-                    self._update(found[0], value, label, note)
-                except NotFound:
-                    continue  # the item vanished under a concurrent delete: start over
-            # Concurrent creates can leave several items; every writer keeps the oldest one, so
-            # they converge on exactly one item instead of deleting each other's. An update of a
-            # single existing item cannot have created a duplicate, so skip the second search.
-            if found and len(found) == 1:
+        meta = {"note": note, "origin": origin}
+        # Writers of one ref take turns: search-then-create is not atomic in the Secret Service.
+        with ref_lock(collection, ref.service, ref.account):
+            for _attempt in range(3):
+                found = self._find(ref)
+                if not found:
+                    self._create(collection, ref, value, label, meta)
+                else:
+                    try:
+                        self._update(found[0], value, label, meta)
+                    except NotFound:
+                        continue  # the item vanished under a concurrent delete: start over
+                # The lock covers writers on this machine; a writer elsewhere (another uid, an
+                # app that is not keychain-cli) can still race, so duplicates are still folded
+                # into the oldest item. An update of a single item cannot have created one.
+                if found and len(found) == 1:
+                    return
+                for extra in self._find(ref)[1:]:
+                    with contextlib.suppress(NotFound):
+                        self._delete_item(extra, ref)
                 return
-            for extra in self._find(ref)[1:]:
-                with contextlib.suppress(NotFound):
-                    self._delete_item(extra, ref)
-            return
         raise BackendError(f"storing {ref} kept racing with concurrent deletes")
 
-    def _update(self, item: str, value: bytes, label: str | None, note: str | None) -> None:
+    def _update(self, item: str, value: bytes, label: str | None, meta: dict[str, str | None]) -> None:
         self._call(item, ITEM, "SetSecret", "(oayays)", [self._secret_struct(value)], vanishable=True)
-        if note is not None:
+        if any(v is not None for v in meta.values()):
             attrs = dict(self._prop(item, ITEM, "Attributes", vanishable=True))
-            if note:
-                attrs["note"] = note
-            else:
-                attrs.pop("note", None)
+            for key, text in meta.items():
+                if text:
+                    attrs[key] = text
+                elif text is not None:
+                    attrs.pop(key, None)
             self._call(
                 item, PROPS, "Set", "ssv", [ITEM, "Attributes", Variant("a{ss}", attrs)], vanishable=True
             )
         if label is not None:
             self._call(item, PROPS, "Set", "ssv", [ITEM, "Label", Variant("s", label)], vanishable=True)
 
-    def _create(self, collection: str, ref: Ref, value: bytes, label: str | None, note: str | None) -> None:
+    def _create(
+        self, collection: str, ref: Ref, value: bytes, label: str | None, meta: dict[str, str | None]
+    ) -> None:
         attrs = {"xdg:schema": SCHEMA, "service": ref.service, "account": ref.account}
-        if note:
-            attrs["note"] = note
+        attrs.update({k: v for k, v in meta.items() if v})
         props = {
             f"{ITEM}.Label": Variant("s", label or str(ref)),
             f"{ITEM}.Attributes": Variant("a{ss}", attrs),
@@ -325,13 +338,15 @@ class SecretServiceBackend:
         self._complete_prompt(prompt, f"deleting {ref}")
 
     def delete(self, ref: Ref) -> None:
-        self._ensure_unlocked(self.collection(), f"deleting {ref}")
-        found = self._find(ref)
-        if not found:
-            raise NotFound(f"no secret {ref}")
-        for item in found:
-            with contextlib.suppress(NotFound):  # a concurrent delete got there first
-                self._delete_item(item, ref)
+        collection = self.collection()
+        self._ensure_unlocked(collection, f"deleting {ref}")
+        with ref_lock(collection, ref.service, ref.account):
+            found = self._find(ref)
+            if not found:
+                raise NotFound(f"no secret {ref}")
+            for item in found:
+                with contextlib.suppress(NotFound):  # a concurrent delete got there first
+                    self._delete_item(item, ref)
 
     def _info(self, item: str) -> ItemInfo | None:
         """Metadata of one of our items; None for foreign items and items deleted meanwhile."""
@@ -346,6 +361,7 @@ class SecretServiceBackend:
             ref=Ref(attrs["service"], attrs["account"]),
             label=props.get("Label", ""),
             note=attrs.get("note", ""),
+            origin=attrs.get("origin", ""),
             created=props.get("Created") or None,
             modified=props.get("Modified") or None,
         )
@@ -376,33 +392,55 @@ class SecretServiceBackend:
         for path in [*unlocked, *locked]:
             if not path.startswith(COLLECTION_PREFIX):
                 continue
-            props = self._call(path, PROPS, "GetAll", "s", [ITEM])[0]
-            attrs = props.get("Attributes", {})
-            if attrs.get("xdg:schema") == SCHEMA:
-                continue
-            out.append(
-                SystemItem(
-                    id=path[len(COLLECTION_PREFIX) :],
-                    label=props.get("Label", ""),
-                    kind=attrs.get("xdg:schema", ""),
-                    attributes=safe_attributes(attrs),
-                    locked=bool(props.get("Locked", path in locked)),
-                )
-            )
+            item = self._system_item(path, locked=path in locked)
+            if item is not None:
+                out.append(item)
         return sorted(out, key=lambda s: s.id)
 
-    def system_get(self, ident: str) -> bytes:
+    def _system_item(self, path: str, locked: bool = False) -> SystemItem | None:
+        """Safe metadata of a foreign item; None for our own items and items deleted meanwhile."""
+        try:
+            props = self._call(path, PROPS, "GetAll", "s", [ITEM], vanishable=True)[0]
+        except NotFound:
+            return None  # another app deleted it between the search and this read
+        attrs = props.get("Attributes", {})
+        if attrs.get("xdg:schema") == SCHEMA:
+            return None
+        return SystemItem(
+            id=path[len(COLLECTION_PREFIX) :],
+            label=props.get("Label", ""),
+            kind=attrs.get("xdg:schema", ""),
+            attributes=safe_attributes(attrs),
+            locked=bool(props.get("Locked", locked)),
+        )
+
+    def _system_path(self, ident: str) -> str:
         if not _ID_RE.fullmatch(ident):
             raise UsageError(
                 f"invalid Secret Service item id {ident!r}",
                 fix="use an id from `keychain system list`, e.g. login/12",
             )
-        path = COLLECTION_PREFIX + ident
+        return COLLECTION_PREFIX + ident
+
+    def system_info(self, ident: str) -> SystemItem:
+        item = self._system_item(self._system_path(ident))
+        if item is None:
+            raise NotFound(f"no system item {ident}", fix="ids come from `keychain system list`")
+        return item
+
+    def system_get(self, ident: str) -> bytes:
+        path = self._system_path(ident)
         self._ensure_unlocked(path, f"reading system:{ident}")
-        if self._prop(path, ITEM, "Attributes").get("xdg:schema") == SCHEMA:
-            # Reading our own item by id would sidestep the namespace check on its ref.
-            raise UsageError(f"system:{ident} is a keychain-cli item; address it by its service/account ref")
-        secret = self._call(path, ITEM, "GetSecret", "o", [self.session], vanishable=True)[0]
+        try:
+            attrs = self._prop(path, ITEM, "Attributes", vanishable=True)
+            if attrs.get("xdg:schema") == SCHEMA:
+                # Reading our own item by id would sidestep the namespace check on its ref.
+                raise UsageError(
+                    f"system:{ident} is a keychain-cli item; address it by its service/account ref"
+                )
+            secret = self._call(path, ITEM, "GetSecret", "o", [self.session], vanishable=True)[0]
+        except NotFound as exc:  # deleted by its app meanwhile: same answer as "not there"
+            raise NotFound(f"no system item {ident}") from exc
         return bytes(secret[2])
 
     # ── unlock and status ────────────────────────────────────────────────────
@@ -434,6 +472,14 @@ class SecretServiceBackend:
         if confirm and getpass.getpass("Repeat: ") != first:
             raise UsageError("the passwords do not match")
         return first.encode("utf-8")
+
+    def ensure_unlocked(self, what: str, system_id: str | None = None) -> None:
+        """Unlock our collection (or, with ``system_id``, that item's collection) before a lookup
+        that must not miss: a collection loaded locked need not expose its items' attributes, so
+        a search could come back empty and look like "no such item" or "no URL". Prompts like a
+        read does (exit 9 when headless)."""
+        path = self._system_path(system_id) if system_id else self.collection()
+        self._ensure_unlocked(path, what)
 
     def unlock(self, create: bool = False) -> str:
         try:

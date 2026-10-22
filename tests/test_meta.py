@@ -39,7 +39,8 @@ def test_install_skill(tmp_path, monkeypatch, capsys):
 def test_imports_are_stdlib_only():
     code = (
         "import sys, keychainlib.cli, keychainlib.backends.secretservice, "
-        "keychainlib.backends.macos, keychainlib.execution, keychainlib.doctor; "
+        "keychainlib.backends.macos, keychainlib.execution, keychainlib.doctor, "
+        "keychainlib.browser, keychainlib.cdp; "
         "mods = {m.split('.')[0] for m in sys.modules}; "
         "extra = mods - set(sys.stdlib_module_names) - {'keychainlib', '__main__', "
         "'sitecustomize', 'usercustomize'}; "
@@ -54,3 +55,21 @@ def test_imports_are_stdlib_only():
         check=True,
     ).stdout.strip()
     assert out == "[]"
+
+
+def test_install_skill_leaves_a_foreign_skill_alone(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    foreign = tmp_path / ".agents" / "skills" / "keychain" / "SKILL.md"
+    foreign.parent.mkdir(parents=True)
+    foreign.write_text("---\nname: keychain\ndescription: the ssh-agent manager\n---\n")
+    assert cli.main(["install-skill"]) == 2
+    assert "another skill" in capsys.readouterr().err
+    assert "ssh-agent" in foreign.read_text()
+
+
+def test_install_skill_reports_a_file_in_the_way(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".agents" / "skills").mkdir(parents=True)
+    (tmp_path / ".agents" / "skills" / "keychain").write_text("not a directory")
+    assert cli.main(["install-skill"]) == 2
+    assert "cannot write" in capsys.readouterr().err
